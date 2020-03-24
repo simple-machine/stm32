@@ -28,10 +28,11 @@ Make sure communication is kept between the host and the client. If tha clients 
 
 ## Set power/speed:
 Set the power or speed of the motor to a certain value. To accomodate for a variety of hardware and a potential lack of encoder for the motor, this value does not need to map to any concrete unit nor value. In case a motor with feedback is controlled, this should be a linear mapping of speed to ease the operation of the mobile device. If a simple motor is used, the mobile will make the control loop based on visual results.
- - Host: 0x01 <speed (16-bit unsigned integer)>
+ - Host: 0x01 <speed (16-bit signed integer)>
  - Client: 0x00
 
 # Error codes
  - **0x01**: Missing argument for *power/speed* command
+ - **0xFD**: Disconnected
  - **0xFE**: Communication error
  - **0xFF**: Unknown command

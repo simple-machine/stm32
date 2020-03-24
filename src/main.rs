@@ -17,14 +17,6 @@ use stm32f1xx_hal::{
 use usb_device::{bus::UsbBusAllocator, prelude::*};
 use usbd_serial::{SerialPort, USB_CLASS_CDC};
 
-/// A ring buffer to hold tokens to eventually send to the device
-#[derive(Default, Debug, PartialEq, Eq)]
-pub struct WriteBuf {
-    buf: [u8; 32],
-    start: usize,
-    end: usize,
-}
-
 /// The protocol state machine (for initialization of the device)
 #[derive(Debug, PartialEq, Eq)]
 pub enum State {
@@ -48,6 +40,12 @@ pub enum ErrorState {
 
 const VERSION: u16 = 0;
 
+pub struct Error {
+    error: ErrorState,
+    led: PC13<Output<PushPull>>,
+    timer: CountDownTimer<pac::TIM1>,
+}
+
 #[app(device = stm32f1xx_hal::stm32, peripherals = true)]
 const APP: () = {
     struct Resources {
@@ -55,20 +53,15 @@ const APP: () = {
         usb_dev: UsbDevice<'static, UsbBusType>,
         serial: SerialPort<'static, UsbBusType>,
 
-        // Bytes to send as messages
-        send_backlog: WriteBuf,
-
         // Protocol state
         #[init(State::Start)]
         state: State,
 
         // Error state
-        #[init(ErrorState::Ok)]
-        error: ErrorState,
+        error: Error,
 
-        // led blink
-        led: PC13<Output<PushPull>>,
-        timer: CountDownTimer<pac::TIM1>,
+        // detect disconnects
+        disconnect_timer: CountDownTimer<pac::TIM2>,
     }
 
     #[init]
@@ -125,106 +118,143 @@ const APP: () = {
 
         // Blinking led rate
         let timer = Timer::tim1(p.TIM1, &clock, &mut rcc.apb2).start_count_down(10.hz());
+        let disconnect_timer = Timer::tim2(p.TIM2, &clock, &mut rcc.apb1).start_count_down(1.hz());
+
         init::LateResources {
             usb_dev,
             serial,
-            timer,
-            led,
-            send_backlog: WriteBuf::default(),
+            error: Error {
+                led,
+                timer,
+                error: ErrorState::Ok,
+            },
+            disconnect_timer,
         }
     }
 
-    #[task(binds = USB_HP_CAN_TX, priority = 2, resources = [usb_dev, serial, send_backlog, led, timer, state, error])]
+    #[task(
+        binds = USB_HP_CAN_TX,
+        priority = 2,
+        resources = [usb_dev, serial, error, state, disconnect_timer]
+    )]
     fn usb_tx(mut cx: usb_tx::Context) {
         // If the initialization failed, don't even process usb
-        if *cx.resources.error != ErrorState::Fatal {
-            *cx.resources.error = usb(
-                &mut cx.resources.usb_dev,
-                &mut cx.resources.serial,
-                &mut cx.resources.send_backlog,
-                &mut cx.resources.state,
-            );
-            // Set the led
-            match *cx.resources.error {
-                // Turn it off
-                ErrorState::Ok => cx.resources.led.set_high().unwrap(),
-                // Turn it on
-                ErrorState::Request => cx.resources.led.set_low().unwrap(),
-                // Start the blinking
-                ErrorState::Fatal => cx.resources.timer.listen(Event::Update),
+        if cx.resources.usb_dev.poll(&mut [cx.resources.serial]) {
+            // same as above
+            if cx.resources.error.error != ErrorState::Fatal {
+                cx.resources.error.error = usb(
+                    &mut cx.resources.serial,
+                    &mut cx.resources.state,
+                    &mut cx.resources.disconnect_timer,
+                );
+                // Set the led
+                match cx.resources.error.error {
+                    // Turn it off
+                    ErrorState::Ok => cx.resources.error.led.set_high().unwrap(),
+                    // Turn it on
+                    ErrorState::Request => cx.resources.error.led.set_low().unwrap(),
+                    // Start the blinking
+                    ErrorState::Fatal => cx.resources.error.timer.listen(Event::Update),
+                }
+            } else {
+                let mut buf = [0; 4];
+                let _ = cx.resources.serial.read(&mut buf);
+                let _ = cx.resources.serial.write(&[0xFD]);
             }
         }
     }
 
-    #[task(binds = USB_LP_CAN_RX0, priority = 2, resources = [usb_dev, serial, send_backlog, led, timer, state, error])]
+    #[task(
+        binds = USB_LP_CAN_RX0,
+        priority = 2,
+        resources = [usb_dev, serial, state, error, disconnect_timer]
+    )]
     fn usb_rx0(mut cx: usb_rx0::Context) {
-        // same as above
-        if *cx.resources.error != ErrorState::Fatal {
-            *cx.resources.error = usb(
-                &mut cx.resources.usb_dev,
-                &mut cx.resources.serial,
-                &mut cx.resources.send_backlog,
-                &mut cx.resources.state,
-            );
-            match *cx.resources.error {
-                ErrorState::Ok => cx.resources.led.set_high().unwrap(),
-                ErrorState::Request => cx.resources.led.set_low().unwrap(),
-                ErrorState::Fatal => cx.resources.timer.listen(Event::Update),
+        if cx.resources.usb_dev.poll(&mut [cx.resources.serial]) {
+            // same as above
+            if cx.resources.error.error != ErrorState::Fatal {
+                cx.resources.error.error = usb(
+                    &mut cx.resources.serial,
+                    &mut cx.resources.state,
+                    &mut cx.resources.disconnect_timer,
+                );
+                match cx.resources.error.error {
+                    ErrorState::Ok => cx.resources.error.led.set_high().unwrap(),
+                    ErrorState::Request => cx.resources.error.led.set_low().unwrap(),
+                    ErrorState::Fatal => cx.resources.error.timer.listen(Event::Update),
+                }
+            } else {
+                let mut buf = [0; 4];
+                let _ = cx.resources.serial.read(&mut buf);
+                let _ = cx.resources.serial.write(&[0xFD]);
             }
         }
     }
 
-    #[task(binds = TIM1_UP, priority = 1, resources = [led, timer])]
+    #[task(binds = TIM1_UP, priority = 1, resources = [error])]
     fn tick(mut cx: tick::Context) {
-        // Toggle led
-        cx.resources.led.lock(|led| led.toggle()).unwrap();
+        cx.resources.error.lock(|e| {
+            // Toggle led
+            e.led.toggle().unwrap();
 
-        // Clears the update flag (else the timer will trigger right after)
-        cx.resources
-            .timer
-            .lock(|timer| timer.clear_update_interrupt_flag());
+            // Clears the update flag (else the timer will trigger right after)
+            e.timer.clear_update_interrupt_flag();
+        });
+    }
+
+    #[task(binds = TIM2, priority = 1, resources = [error, disconnect_timer, state])]
+    fn disconnect(mut cx: disconnect::Context) {
+        cx.resources.disconnect_timer.lock(|t| {
+            t.clear_update_interrupt_flag();
+            t.unlisten(Event::Update);
+        });
+        cx.resources.error.lock(|e| {
+            e.timer.listen(Event::Update);
+            e.error = ErrorState::Fatal;
+        });
     }
 };
 
 fn usb<B: usb_device::bus::UsbBus>(
-    usb_dev: &mut UsbDevice<'static, B>,
     serial: &mut SerialPort<'static, B>,
-    send_backlog: &mut WriteBuf,
     state: &mut State,
+    disconnect_timer: &mut CountDownTimer<pac::TIM2>,
 ) -> ErrorState {
-    if usb_dev.poll(&mut [serial]) {
-        loop {
-            match state {
-                State::Start => {
-                    let mut buf = [0u8; 4];
-                    match serial.read(&mut buf) {
-                        Ok(4) if buf == [0x73, 0x6d, 0x6f, 0x76] => *state = State::Magic,
-                        Err(UsbError::WouldBlock) => return ErrorState::Ok,
-                        _ => return ErrorState::Fatal,
-                    }
-                }
-                State::Magic => match serial.write(&[0x73, 0x6d, 0x6f, 0x76]) {
-                    Ok(4) => *state = State::Version,
+    loop {
+        match state {
+            State::Start => {
+                let mut buf = [0u8; 4];
+                match serial.read(&mut buf) {
+                    Ok(4) if buf == [0x73, 0x6d, 0x6f, 0x76] => *state = State::Magic,
                     Err(UsbError::WouldBlock) => return ErrorState::Ok,
                     _ => return ErrorState::Fatal,
-                },
-                State::Version => match serial.write(&VERSION.to_be_bytes()) {
-                    Ok(2) => *state = State::Confirmation,
+                }
+            }
+            State::Magic => match serial.write(&[0x73, 0x6d, 0x6f, 0x76]) {
+                Ok(4) => *state = State::Version,
+                Err(UsbError::WouldBlock) => return ErrorState::Ok,
+                _ => return ErrorState::Fatal,
+            },
+            State::Version => match serial.write(&VERSION.to_be_bytes()) {
+                Ok(2) => *state = State::Confirmation,
+                Err(UsbError::WouldBlock) => return ErrorState::Ok,
+                _ => return ErrorState::Fatal,
+            },
+            State::Confirmation => {
+                let mut buf = [0u8; 1];
+                match serial.read(&mut buf) {
+                    Ok(1) if buf == [0x00] => *state = State::Normal,
                     Err(UsbError::WouldBlock) => return ErrorState::Ok,
                     _ => return ErrorState::Fatal,
-                },
-                State::Confirmation => {
-                    let mut buf = [0u8; 1];
-                    match serial.read(&mut buf) {
-                        Ok(1) if buf == [0x00] => *state = State::Normal,
-                        Err(UsbError::WouldBlock) => return ErrorState::Ok,
-                        _ => return ErrorState::Fatal,
-                    }
                 }
-                State::Normal => {
-                    let mut error = false;
-                    let mut buf = [0u8; 64];
-                    if let Ok(o) = serial.read(&mut buf) {
+                disconnect_timer.clear_update_interrupt_flag();
+                disconnect_timer.listen(Event::Update);
+            }
+            State::Normal => {
+                let mut error = false;
+                let mut buf = [0u8; 64];
+                match serial.read(&mut buf) {
+                    Ok(o) => {
                         let response = match buf[..o] {
                             [0x00] => 0x00,
                             [0x01, speed_high, speed_low] => {
@@ -238,34 +268,20 @@ fn usb<B: usb_device::bus::UsbBus>(
                         if response != 0x00 {
                             error = true;
                         }
-                        send_backlog.buf[send_backlog.end] = response;
-                        send_backlog.end += 1;
-                        send_backlog.end %= send_backlog.buf.len();
+                        disconnect_timer.reset();
+                        serial.write(&[response]).unwrap();
                     }
-                    if send_backlog.start <= send_backlog.end {
-                        if let Ok(written) =
-                            serial.write(&send_backlog.buf[send_backlog.start..send_backlog.end])
-                        {
-                            send_backlog.start += written;
-                        }
-                    } else if send_backlog.start > send_backlog.end {
-                        if let Ok(written) = serial.write(&send_backlog.buf[send_backlog.start..]) {
-                            send_backlog.start += written;
-                        }
-                        if let Ok(written) = serial.write(&send_backlog.buf[..send_backlog.end]) {
-                            send_backlog.start += written;
-                        }
-                        send_backlog.start %= send_backlog.buf.len();
+                    Err(UsbError::WouldBlock) => {
+                        return ErrorState::Ok;
                     }
-                    return if error {
-                        ErrorState::Request
-                    } else {
-                        ErrorState::Ok
-                    };
+                    _ => return ErrorState::Fatal,
                 }
+                return if error {
+                    ErrorState::Request
+                } else {
+                    ErrorState::Ok
+                };
             }
         }
-    } else {
-        ErrorState::Ok
     }
 }
