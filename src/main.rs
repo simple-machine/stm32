@@ -11,7 +11,8 @@ use stm32f1xx_hal::{
     gpio::{gpioc::PC13, GpioExt, Output, PushPull},
     pac,
     prelude::*,
-    timer::{CountDownTimer, Event, Timer},
+    pwm::{Pwm, C1},
+    timer::{CountDownTimer, Event, Tim4NoRemap, Timer},
     usb::{self, UsbBus, UsbBusType},
 };
 use usb_device::{bus::UsbBusAllocator, prelude::*};
@@ -62,6 +63,9 @@ const APP: () = {
 
         // detect disconnects
         disconnect_timer: CountDownTimer<pac::TIM2>,
+
+        // motor control
+        motor: Pwm<pac::TIM4, C1>,
     }
 
     #[init]
@@ -82,6 +86,7 @@ const APP: () = {
         assert!(clock.usbclk_valid());
 
         let mut gpioa = p.GPIOA.split(&mut rcc.apb2);
+        let mut gpiob = p.GPIOB.split(&mut rcc.apb2);
         let mut gpioc = p.GPIOC.split(&mut rcc.apb2);
 
         // Turn off the led (low = lit)
@@ -120,6 +125,15 @@ const APP: () = {
         let timer = Timer::tim1(p.TIM1, &clock, &mut rcc.apb2).start_count_down(10.hz());
         let disconnect_timer = Timer::tim2(p.TIM2, &clock, &mut rcc.apb1).start_count_down(1.hz());
 
+        // Motor control
+        let mut afio = p.AFIO.constrain(&mut rcc.apb2);
+        let motor_pin = gpiob.pb6.into_alternate_push_pull(&mut gpiob.crl);
+        let motor = Timer::tim4(p.TIM4, &clock, &mut rcc.apb1).pwm::<Tim4NoRemap, _, _, _>(
+            motor_pin,
+            &mut afio.mapr,
+            1.khz(),
+        );
+
         init::LateResources {
             usb_dev,
             serial,
@@ -129,13 +143,14 @@ const APP: () = {
                 error: ErrorState::Ok,
             },
             disconnect_timer,
+            motor,
         }
     }
 
     #[task(
         binds = USB_HP_CAN_TX,
         priority = 2,
-        resources = [usb_dev, serial, error, state, disconnect_timer]
+        resources = [usb_dev, serial, error, state, disconnect_timer, motor]
     )]
     fn usb_tx(mut cx: usb_tx::Context) {
         // If the initialization failed, don't even process usb
@@ -146,6 +161,7 @@ const APP: () = {
                     &mut cx.resources.serial,
                     &mut cx.resources.state,
                     &mut cx.resources.disconnect_timer,
+                    &mut cx.resources.motor,
                 );
                 // Set the led
                 match cx.resources.error.error {
@@ -167,7 +183,7 @@ const APP: () = {
     #[task(
         binds = USB_LP_CAN_RX0,
         priority = 2,
-        resources = [usb_dev, serial, state, error, disconnect_timer]
+        resources = [usb_dev, serial, state, error, disconnect_timer, motor]
     )]
     fn usb_rx0(mut cx: usb_rx0::Context) {
         if cx.resources.usb_dev.poll(&mut [cx.resources.serial]) {
@@ -177,6 +193,7 @@ const APP: () = {
                     &mut cx.resources.serial,
                     &mut cx.resources.state,
                     &mut cx.resources.disconnect_timer,
+                    &mut cx.resources.motor,
                 );
                 match cx.resources.error.error {
                     ErrorState::Ok => cx.resources.error.led.set_high().unwrap(),
@@ -219,6 +236,7 @@ fn usb<B: usb_device::bus::UsbBus>(
     serial: &mut SerialPort<'static, B>,
     state: &mut State,
     disconnect_timer: &mut CountDownTimer<pac::TIM2>,
+    motor: &mut Pwm<pac::TIM4, C1>,
 ) -> ErrorState {
     loop {
         match state {
@@ -249,6 +267,7 @@ fn usb<B: usb_device::bus::UsbBus>(
                 }
                 disconnect_timer.clear_update_interrupt_flag();
                 disconnect_timer.listen(Event::Update);
+                motor.enable();
             }
             State::Normal => {
                 let mut error = false;
@@ -258,8 +277,10 @@ fn usb<B: usb_device::bus::UsbBus>(
                         let response = match buf[..o] {
                             [0x00] => 0x00,
                             [0x01, speed_high, speed_low] => {
-                                let speed = u16::from_be_bytes([speed_high, speed_low]);
-                                // Set motor speed
+                                let speed = i16::from_be_bytes([speed_high, speed_low]);
+                                let duty = motor.get_max_duty() as u32 * speed as u32
+                                    / core::u16::MAX as u32;
+                                motor.set_duty(duty as u16);
                                 0x00
                             }
                             [0x01, ..] => 0x01,
